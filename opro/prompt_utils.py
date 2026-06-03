@@ -11,17 +11,35 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The utility functions for prompting GPT and Google Cloud models."""
+"""The utility functions for prompting GPT, Google Cloud, and local vLLM models."""
 
 import time
-import google.generativeai as palm
-import openai
+
+try:
+    import google.generativeai as palm
+    _PALM_AVAILABLE = True
+except ImportError:
+    _PALM_AVAILABLE = False
+
+try:
+    import openai as _openai_legacy
+    _LEGACY_OPENAI = True
+except ImportError:
+    _LEGACY_OPENAI = False
+
+# openai >= 1.0 client (used for vLLM and modern OpenAI API)
+try:
+    from openai import OpenAI as _OpenAIClient
+    _OPENAI_V1_AVAILABLE = True
+except ImportError:
+    _OPENAI_V1_AVAILABLE = False
 
 
 def call_openai_server_single_prompt(
     prompt, model="gpt-3.5-turbo", max_decode_steps=20, temperature=0.8
 ):
   """The function to call OpenAI server with an input string."""
+  import openai
   try:
     completion = openai.ChatCompletion.create(
         model=model,
@@ -130,3 +148,98 @@ def call_palm_server_from_cloud(
     return call_palm_server_from_cloud(
         input_text, max_decode_steps=max_decode_steps, temperature=temperature
     )
+
+
+# ---------------------------------------------------------------------------
+# Local vLLM server (OpenAI-compatible API)
+# ---------------------------------------------------------------------------
+
+def call_vllm_server_single_prompt(
+    prompt,
+    base_url="http://localhost:8000/v1",
+    model="Qwen/Qwen2.5-7B-Instruct",
+    max_decode_steps=512,
+    temperature=1.0,
+    api_key="EMPTY",
+    max_retries=5,
+    retry_wait=5,
+):
+  """Call a locally served vLLM instance via its OpenAI-compatible HTTP API.
+
+  Args:
+    prompt: The user prompt string.
+    base_url: Base URL of the vLLM server, e.g. ``http://localhost:8000/v1``.
+    model: The model name as reported by the vLLM server (use the HuggingFace
+      repo id or whatever name vLLM was started with).
+    max_decode_steps: Maximum number of tokens to generate.
+    temperature: Sampling temperature.
+    api_key: Placeholder API key (vLLM ignores this but the client requires it).
+    max_retries: How many times to retry on transient errors.
+    retry_wait: Seconds to wait between retries.
+
+  Returns:
+    The generated text string, or an empty string on persistent failure.
+  """
+  if not _OPENAI_V1_AVAILABLE:
+    raise ImportError(
+        "openai>=1.0 is required to call vLLM. "
+        "Install it with: pip install 'openai>=1.0'"
+    )
+
+  client = _OpenAIClient(base_url=base_url, api_key=api_key)
+
+  for attempt in range(max_retries):
+    try:
+      completion = client.chat.completions.create(
+          model=model,
+          messages=[{"role": "user", "content": prompt}],
+          max_tokens=max_decode_steps,
+          temperature=temperature,
+      )
+      return completion.choices[0].message.content
+    except Exception as e:  # pylint: disable=broad-except
+      print(
+          f"[vLLM] Attempt {attempt + 1}/{max_retries} failed: {e}. "
+          f"Retrying in {retry_wait}s..."
+      )
+      time.sleep(retry_wait)
+
+  print("[vLLM] All retries exhausted. Returning empty string.")
+  return ""
+
+
+def call_vllm_server_func(
+    inputs,
+    base_url="http://localhost:8000/v1",
+    model="Qwen/Qwen2.5-7B-Instruct",
+    max_decode_steps=512,
+    temperature=1.0,
+    api_key="EMPTY",
+):
+  """Call a locally served vLLM instance for a list of prompt strings.
+
+  Args:
+    inputs: A single prompt string or a list of prompt strings.
+    base_url: Base URL of the vLLM server.
+    model: The model name as served by vLLM.
+    max_decode_steps: Maximum tokens to generate per prompt.
+    temperature: Sampling temperature.
+    api_key: Placeholder API key.
+
+  Returns:
+    A list of generated text strings, one per input prompt.
+  """
+  if isinstance(inputs, str):
+    inputs = [inputs]
+  outputs = []
+  for prompt in inputs:
+    output = call_vllm_server_single_prompt(
+        prompt,
+        base_url=base_url,
+        model=model,
+        max_decode_steps=max_decode_steps,
+        temperature=temperature,
+        api_key=api_key,
+    )
+    outputs.append(output)
+  return outputs
