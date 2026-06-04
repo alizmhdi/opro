@@ -30,10 +30,19 @@ Supported objectives:
 from __future__ import annotations
 
 import re
+import sys
+import os
 from collections import defaultdict
-from typing import Callable, List, Optional
+from typing import List, Optional
 
 import numpy as np
+
+# Allow importing prompt_utils from the OPRO package
+_OPRO_PKG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
+if _OPRO_PKG_DIR not in sys.path:
+    sys.path.insert(0, _OPRO_PKG_DIR)
+
+from opro.prompt_utils import call_vllm_server_single_prompt  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -102,14 +111,15 @@ def _path_to_edges(path):
 # Routing evaluation
 # ---------------------------------------------------------------------------
 
-def evaluate_routing(routing_indices, tm, commodities, edge_cap, objective):
-    """Evaluate a single-path routing assignment.
+def evaluate_routing(routing_splits, tm, commodities, edge_cap, objective):
+    """Evaluate a multi-path split-ratio routing.
 
     Parameters
     ----------
-    routing_indices : list[int]
-        One path index per commodity (0-indexed, relative to that OD pair's
-        local path list).  Values exceeding the path count wrap around (modulo).
+    routing_splits : list[list[float]]
+        For each commodity, a list of fractions (one per available path)
+        that sum to 1.0.  Each fraction specifies what portion of the demand
+        is routed through the corresponding path.
     tm : np.ndarray, shape (N, N)
         Traffic demand matrix.
     commodities : list
@@ -125,23 +135,26 @@ def evaluate_routing(routing_indices, tm, commodities, edge_cap, objective):
         MLU (lower is better) or total routed flow (higher is better).
     """
     if objective == "min_max_link_util":
-        return _eval_mlu(routing_indices, tm, commodities, edge_cap)
+        return _eval_mlu(routing_splits, tm, commodities, edge_cap)
     elif objective == "total_flow":
-        return _eval_total_flow(routing_indices, tm, commodities, edge_cap)
+        return _eval_total_flow(routing_splits, tm, commodities, edge_cap)
     else:
         raise ValueError(f"Unknown objective: {objective!r}")
 
 
-def _eval_mlu(routing_indices, tm, commodities, edge_cap):
-    """Compute max link utilisation for a single-path routing."""
+def _eval_mlu(routing_splits, tm, commodities, edge_cap):
+    """Compute max link utilisation for a split-ratio routing."""
     edge_flow: dict = defaultdict(float)
     for commod_id, s_idx, t_idx, path_edge_lists in commodities:
         demand = float(tm[s_idx, t_idx])
         if demand <= 0.0:
             continue
-        local_idx = routing_indices[commod_id] % len(path_edge_lists)
-        for u, v in path_edge_lists[local_idx]:
-            edge_flow[(u, v)] += demand
+        fracs = routing_splits[commod_id]
+        for path_idx, frac in enumerate(fracs):
+            if frac <= 0.0 or path_idx >= len(path_edge_lists):
+                continue
+            for u, v in path_edge_lists[path_idx]:
+                edge_flow[(u, v)] += frac * demand
 
     mlu = 0.0
     for (u, v), cap in edge_cap.items():
@@ -150,11 +163,12 @@ def _eval_mlu(routing_indices, tm, commodities, edge_cap):
     return mlu
 
 
-def _eval_total_flow(routing_indices, tm, commodities, edge_cap):
-    """Compute greedy total flow for a single-path routing.
+def _eval_total_flow(routing_splits, tm, commodities, edge_cap):
+    """Compute greedy total flow for a split-ratio routing.
 
-    OD pairs are processed largest-demand-first.  Each demand is routed on
-    its chosen path up to the remaining bottleneck capacity on that path.
+    OD pairs are processed largest-demand-first.  For each OD pair, demand
+    is split across paths proportionally and each slice is routed up to the
+    remaining bottleneck capacity on that path.
     """
     remaining_cap = dict(edge_cap)
     total_flow = 0.0
@@ -166,16 +180,20 @@ def _eval_total_flow(routing_indices, tm, commodities, edge_cap):
         demand = float(tm[s_idx, t_idx])
         if demand <= 0.0:
             continue
-        local_idx = routing_indices[commod_id] % len(path_edge_lists)
-        edges = path_edge_lists[local_idx]
-        if not edges:
-            continue
-        bottleneck = min(remaining_cap.get((u, v), 0.0) for u, v in edges)
-        allocated = min(demand, max(0.0, bottleneck))
-        if allocated > 0.0:
-            total_flow += allocated
-            for u, v in edges:
-                remaining_cap[(u, v)] = remaining_cap.get((u, v), 0.0) - allocated
+        fracs = routing_splits[commod_id]
+        for path_idx, frac in enumerate(fracs):
+            if frac <= 0.0 or path_idx >= len(path_edge_lists):
+                continue
+            path_demand = frac * demand
+            edges = path_edge_lists[path_idx]
+            if not edges:
+                continue
+            bottleneck = min(remaining_cap.get((u, v), 0.0) for u, v in edges)
+            allocated = min(path_demand, max(0.0, bottleneck))
+            if allocated > 0.0:
+                total_flow += allocated
+                for u, v in edges:
+                    remaining_cap[(u, v)] = remaining_cap.get((u, v), 0.0) - allocated
 
     return total_flow
 
@@ -185,16 +203,16 @@ def _eval_total_flow(routing_indices, tm, commodities, edge_cap):
 # ---------------------------------------------------------------------------
 
 def _make_random_routing(num_od_pairs, num_paths_per_od):
-    """Return a random per-OD path index assignment."""
+    """Return a random split-ratio routing using Dirichlet sampling."""
     return [
-        int(np.random.randint(0, max(1, n)))
+        list(np.random.dirichlet(np.ones(max(1, n))))
         for n in num_paths_per_od
     ]
 
 
-def _make_shortest_path_routing(num_od_pairs):
-    """Route all OD pairs on path 0 (assumed to be the shortest path)."""
-    return [0] * num_od_pairs
+def _make_shortest_path_routing(num_paths_per_od):
+    """Route all OD pairs entirely on path 0 (split ratio 1.0 on path 0)."""
+    return [[1.0] + [0.0] * (n - 1) for n in num_paths_per_od]
 
 
 # ---------------------------------------------------------------------------
@@ -240,6 +258,7 @@ def gen_meta_prompt_te(
     commodities,
     od_pair_labels,
     od_pair_paths_text,
+    num_paths,
     max_num_pairs=5,
     objective="min_max_link_util",
 ):
@@ -268,105 +287,70 @@ def gen_meta_prompt_te(
     # show worst first (descending) so the best is last.
     pairs = list(old_value_pairs_set)
     if objective == "min_max_link_util":
-        pairs.sort(key=lambda x: -x[1])   # descending: worst → best at end
+        pairs.sort(key=lambda x: -x[1])
         better_direction = "lower"
-        obj_label = "MLU (Maximum Link Utilisation)"
+        obj_label = "MLU"
     else:
-        pairs.sort(key=lambda x: x[1])    # ascending: worst → best at end
+        pairs.sort(key=lambda x: x[1])
         better_direction = "higher"
-        obj_label = "Total Flow"
+        obj_label = "TotalFlow"
 
-    pairs = pairs[-max_num_pairs:]  # keep only the most recent/best slice
+    pairs = pairs[-max_num_pairs:]
 
-    # ── Topology section ───────────────────────────────────────────────────
-    n_nodes = len(node_names)
-    n_edges = graph.number_of_edges()
-    topo_str = (
-        f"Nodes: {n_nodes} (indexed {node_names[0]}–{node_names[-1]})\n"
-        f"Directed edges (total {n_edges}), top-{min(20, n_edges)} by capacity:\n"
-        + _edge_summary(graph)
-    )
+    # ── Compact paths summary: OD_id(s→t) P0:Nh,P1:Nh,... ────────────────
+    paths_lines = []
+    for commod_id, s_idx, t_idx, path_edge_lists in commodities:
+        hops = ",".join(f"P{i}:{len(e)}h" for i, e in enumerate(path_edge_lists))
+        paths_lines.append(f"OD_{commod_id}({node_names[s_idx]}->{node_names[t_idx]}):{hops}")
+    paths_str = " | ".join(paths_lines)
 
-    # ── Traffic Matrix section ─────────────────────────────────────────────
+    # ── Traffic demands (non-zero only) ────────────────────────────────────
     tm_str = _tm_summary(tm, node_names, commodities)
 
-    # ── Paths section (trimmed for large networks) ─────────────────────────
-    max_paths_show = 40
-    if len(od_pair_paths_text) <= max_paths_show:
-        paths_str = "\n".join(od_pair_paths_text)
-    else:
-        paths_str = (
-            "\n".join(od_pair_paths_text[:max_paths_show])
-            + f"\n  ... ({len(od_pair_paths_text) - max_paths_show} more OD pairs)"
-        )
-
-    # ── Previous solutions section ─────────────────────────────────────────
+    # ── Previous solutions ─────────────────────────────────────────────────
     if pairs:
         prev_str = ""
         for routing_str, score in pairs:
-            score_fmt = f"{score:.4f}"
-            prev_str += f"\n<routing> {routing_str} </routing>\n{obj_label}: {score_fmt}\n"
+            prev_str += f"\n<routing>{routing_str}</routing> {obj_label}:{score:.4f}\n"
         prev_str = prev_str.strip()
     else:
         prev_str = "(none yet)"
 
     # ── Task description ───────────────────────────────────────────────────
     num_od = len(commodities)
-    max_paths_per_od = max(
-        (len(path_edge_lists) for _, _, _, path_edge_lists in commodities),
-        default=1,
-    )
 
-    prompt = f"""You are solving a Traffic Engineering routing optimisation problem.
-
-=== Network ===
-{topo_str}
-
-=== Traffic Demands ===
-{tm_str}
-
-=== Available Paths ===
-Each OD pair has up to {max_paths_per_od} paths (0-indexed). Path nodes are listed in order:
+    prompt = f"""Traffic Engineering routing optimisation.
+Objective: {obj_label}. {better_direction} is better.
+There are EXACTLY {num_od} OD pairs. Each has EXACTLY {num_paths} paths (P0..P{num_paths - 1}).
+Paths (OD_id(src->dst):P0:hops,P1:hops,...):
 {paths_str}
-
-=== Objective ===
-{obj_label}.  A {better_direction} value is better.
-
-=== Previous Routings ===
-Previous routings and their {obj_label} scores are shown below,
-sorted from worst to best ({better_direction} is better):
-
+Demands (OD_id src->dst: demand):
+{tm_str}
+Previous routings (worst to best):
 {prev_str}
-
-=== Task ===
-Provide a new routing that is DIFFERENT from all routings above and achieves
-a {better_direction} {obj_label} than any routing listed.
-
-The routing is a comma-separated list of {num_od} integers, one per OD pair
-in the same order as "=== Available Paths ===" above. Each integer is the
-0-based path index for that OD pair (use 0 if only one path exists).
-
-Wrap the routing in <routing> ... </routing> tags.
-Example format: <routing> 0,1,0,2,1,0,1 </routing>
-""".strip()
+Task: output a routing with {better_direction} {obj_label} than all above.
+Format: {num_od} groups separated by "|"; each group = {num_paths} comma-separated fractions (normalised to sum=1).
+Do NOT output any explanation or reasoning. Output ONLY the splits immediately after <routing>.
+<routing>""".strip()
 
     return prompt
 
 
 def extract_routing(input_string, num_od_pairs):
-    """Parse the LLM output to extract a routing (list of path indices).
+    """Parse the LLM output to extract a split-ratio routing.
 
     Parameters
     ----------
     input_string : str
         Raw LLM output.
     num_od_pairs : int
-        Expected number of path-index values.
+        Expected number of OD pairs.
 
     Returns
     -------
-    list[int] or None
-        Parsed routing or ``None`` if parsing failed.
+    list[list[float]] or None
+        Normalised split ratios (one list of fractions per OD pair, summing
+        to 1.0), or ``None`` if parsing failed.
     """
     if not input_string:
         return None
@@ -374,33 +358,51 @@ def extract_routing(input_string, num_od_pairs):
     # Try to find content between <routing> ... </routing>
     match = re.search(r"<routing>(.*?)</routing>", input_string, re.DOTALL | re.IGNORECASE)
     if match:
-        raw = match.group(1)
+        raw = match.group(1).strip()
     else:
-        # Fallback: look for a comma-separated sequence of integers
-        raw = input_string
+        # Closing tag missing (output truncated or model omitted it).
+        # Extract everything after the opening <routing> tag.
+        open_match = re.search(r"<routing>(.*)", input_string, re.DOTALL | re.IGNORECASE)
+        raw = open_match.group(1).strip() if open_match else input_string.strip()
 
-    tokens = []
-    for tok in re.split(r"[,\s]+", raw.strip()):
-        tok = tok.strip().strip(".,;[](){}")
-        if tok.isdigit() or (tok.startswith("-") and tok[1:].isdigit()):
-            tokens.append(int(tok))
-
-    if len(tokens) != num_od_pairs:
+    od_parts = [p.strip() for p in re.split(r"\|", raw)]
+    # Accept outputs with extra groups (LLM repetition) by truncating;
+    # reject only if there are fewer groups than needed.
+    if len(od_parts) < num_od_pairs:
         return None
+    od_parts = od_parts[:num_od_pairs]
 
-    return tokens
+    routing_splits = []
+    for part in od_parts:
+        fracs = []
+        for tok in re.split(r"[,\s]+", part.strip()):
+            tok = tok.strip().strip(".,;[](){}")
+            if not tok:
+                continue
+            try:
+                fracs.append(float(tok))
+            except ValueError:
+                pass
+        if not fracs:
+            return None
+        total = sum(fracs)
+        if total <= 0.0:
+            return None
+        routing_splits.append([f / total for f in fracs])
+
+    return routing_splits
 
 
 # ---------------------------------------------------------------------------
 # Main OPRO optimization loop
 # ---------------------------------------------------------------------------
 
-def build_edge_allocation(routing_indices, tm, commodities, node_names):
-    """Build an edge-allocation dict from a routing assignment.
+def build_edge_allocation(routing_splits, tm, commodities, node_names):
+    """Build an edge-allocation dict from a split-ratio routing.
 
     Parameters
     ----------
-    routing_indices : list[int]
+    routing_splits : list[list[float]]
     tm : np.ndarray
     commodities : list
     node_names : list
@@ -415,11 +417,14 @@ def build_edge_allocation(routing_indices, tm, commodities, node_names):
         demand = float(tm[s_idx, t_idx])
         if demand <= 0.0:
             continue
-        local_idx = routing_indices[commod_id] % len(path_edge_lists)
+        fracs = routing_splits[commod_id]
         s_name = node_names[s_idx]
         t_name = node_names[t_idx]
-        for u, v in path_edge_lists[local_idx]:
-            allocation[(s_name, t_name)][(u, v)] += demand
+        for path_idx, frac in enumerate(fracs):
+            if frac <= 0.0 or path_idx >= len(path_edge_lists):
+                continue
+            for u, v in path_edge_lists[path_idx]:
+                allocation[(s_name, t_name)][(u, v)] += frac * demand
     return {k: dict(v) for k, v in allocation.items()}
 
 
@@ -428,13 +433,18 @@ def run_opro_te(
     graph,
     node_names,
     paths_dict,
-    call_optimizer_server_func: Callable,
     objective: str = "min_max_link_util",
     num_steps: int = 50,
     num_decode_per_step: int = 4,
     max_num_pairs: int = 5,
     num_starting_points: int = 3,
     verbose: bool = True,
+    vllm_base_url: str = "http://localhost:8000/v1",
+    model_name: str = "Qwen/Qwen2.5-7B-Instruct",
+    max_decode_tokens: int = 1024,
+    temperature: float = 1.0,
+    api_key: str = "EMPTY",
+    num_paths: int = 4,
 ):
     """Run the OPRO optimization loop for Traffic Engineering.
 
@@ -446,11 +456,18 @@ def run_opro_te(
     node_names : list
     paths_dict : dict
         MetaRL-format path dictionary ``{(s, t): [[node, ...], ...]}``
-    call_optimizer_server_func : callable
-        A function ``f(prompt: str) -> list[str]`` that makes a single LLM
-        call and returns a list of generated strings.
+    vllm_base_url : str
+        Base URL of the vLLM OpenAI-compatible server.
+    model_name : str
+        Model name as served by vLLM.
+    max_decode_tokens : int
+        Maximum tokens to generate per LLM call.
+    temperature : float
+        Sampling temperature.
+    api_key : str
+        API key for the vLLM server.
     num_decode_per_step : int
-        How many times to call *call_optimizer_server_func* per OPRO step;
+        How many LLM samples to draw per OPRO step;
         all returned strings are pooled for routing extraction.
     objective : str
     num_steps : int
@@ -473,27 +490,48 @@ def run_opro_te(
     if num_od == 0:
         return 0.0, {}
 
+
+    # Build the vLLM client once and reuse it across all steps/samples.
+    from openai import OpenAI as _OpenAIClient  # noqa: PLC0415
+    _llm_client = _OpenAIClient(base_url=vllm_base_url, api_key=api_key)
+
     num_paths_per_od = [
         len(path_edge_lists) for _, _, _, path_edge_lists in commodities
     ]
 
+    # Cap max_decode_tokens to what's actually needed for split-ratio output:
+    # Compute the minimum tokens needed to output a complete routing.
+    # Each fraction like "0.3," is ~4 tokens; add overhead for tags and separators.
+    _min_needed_tokens = num_od * num_paths * 6 + 128
+    _max_allowed_tokens = _min_needed_tokens
+    if max_decode_tokens < _min_needed_tokens:
+        if verbose:
+            print(f"[OPRO-TE] Raising max_decode_tokens from {max_decode_tokens} "
+                  f"to {_min_needed_tokens} (minimum needed for {num_od} OD pairs x {num_paths} paths)")
+        max_decode_tokens = _min_needed_tokens
+    elif max_decode_tokens > _max_allowed_tokens:
+        if verbose:
+            print(f"[OPRO-TE] Capping max_decode_tokens from {max_decode_tokens} "
+                  f"to {_max_allowed_tokens} (based on {num_od} OD pairs x {num_paths} paths)")
+        max_decode_tokens = _max_allowed_tokens
+
     # ---------- initialise with a few starting points ----------------------
     old_value_pairs_set: set = set()  # {(routing_str, score)}
     best_score: Optional[float] = None
-    best_routing: Optional[List[int]] = None
+    best_routing: Optional[List[List[float]]] = None
 
     # Always include the shortest-path routing as a baseline
-    init_routings = [_make_shortest_path_routing(num_od)]
+    init_routings = [_make_shortest_path_routing(num_paths_per_od)]
     for _ in range(num_starting_points - 1):
         init_routings.append(_make_random_routing(num_od, num_paths_per_od))
 
     for routing in init_routings:
         score = evaluate_routing(routing, tm, commodities, edge_cap, objective)
-        routing_str = ",".join(str(x) for x in routing)
+        routing_str = "|".join(",".join(f"{f:.1f}" for f in fracs) for fracs in routing)
         old_value_pairs_set.add((routing_str, score))
         if best_score is None or _is_better(score, best_score, objective):
             best_score = score
-            best_routing = routing[:]
+            best_routing = [list(fracs) for fracs in routing]
 
     if verbose:
         print(f"[OPRO-TE] Initial best {objective}: {best_score:.4f}")
@@ -508,6 +546,7 @@ def run_opro_te(
             commodities,
             od_pair_labels,
             od_pair_paths_text,
+            num_paths=num_paths,
             max_num_pairs=max_num_pairs,
             objective=objective,
         )
@@ -515,13 +554,21 @@ def run_opro_te(
         if verbose:
             print(f"\n[OPRO-TE] Step {i_step + 1}/{num_steps}")
 
-        raw_outputs = []
-        for _ in range(num_decode_per_step):
-            result = call_optimizer_server_func(meta_prompt)
-            if isinstance(result, str):
-                raw_outputs.append(result)
-            else:
-                raw_outputs.extend(result)
+        # All num_decode_per_step samples are requested in a single HTTP call
+        # via the OpenAI `n` parameter; vLLM batches them on the GPU.
+        raw_outputs = call_vllm_server_single_prompt(
+            meta_prompt,
+            base_url=vllm_base_url,
+            model=model_name,
+            max_decode_steps=max_decode_tokens,
+            temperature=temperature,
+            api_key=api_key,
+            n=num_decode_per_step,
+            client=_llm_client,
+        )
+        print(raw_outputs)
+        if isinstance(raw_outputs, str):
+            raw_outputs = [raw_outputs]
 
         for raw_out in raw_outputs:
             routing = extract_routing(raw_out, num_od)
@@ -531,12 +578,12 @@ def run_opro_te(
                 continue
 
             score = evaluate_routing(routing, tm, commodities, edge_cap, objective)
-            routing_str = ",".join(str(x) for x in routing)
+            routing_str = "|".join(",".join(f"{f:.1f}" for f in fracs) for fracs in routing)
             old_value_pairs_set.add((routing_str, score))
 
             if _is_better(score, best_score, objective):
                 best_score = score
-                best_routing = routing[:]
+                best_routing = [list(fracs) for fracs in routing]
                 if verbose:
                     print(f"  [update] new best {objective}: {best_score:.4f}")
 

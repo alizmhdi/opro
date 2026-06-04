@@ -158,11 +158,13 @@ def call_vllm_server_single_prompt(
     prompt,
     base_url="http://localhost:8000/v1",
     model="Qwen/Qwen2.5-7B-Instruct",
-    max_decode_steps=512,
+    max_decode_steps=1024,
     temperature=1.0,
     api_key="EMPTY",
     max_retries=5,
     retry_wait=5,
+    n=1,
+    client=None,
 ):
   """Call a locally served vLLM instance via its OpenAI-compatible HTTP API.
 
@@ -176,9 +178,15 @@ def call_vllm_server_single_prompt(
     api_key: Placeholder API key (vLLM ignores this but the client requires it).
     max_retries: How many times to retry on transient errors.
     retry_wait: Seconds to wait between retries.
+    n: Number of completions to generate in a single request. When n > 1, all
+      completions are batched on the server side (one HTTP round-trip).
+    client: Optional pre-built ``openai.OpenAI`` client instance. When
+      provided, it is reused instead of creating a new one (avoids repeated
+      connection overhead).
 
   Returns:
-    The generated text string, or an empty string on persistent failure.
+    A single string when n=1, or a list of n strings when n > 1.
+    Returns empty string(s) on persistent failure.
   """
   if not _OPENAI_V1_AVAILABLE:
     raise ImportError(
@@ -186,17 +194,20 @@ def call_vllm_server_single_prompt(
         "Install it with: pip install 'openai>=1.0'"
     )
 
-  client = _OpenAIClient(base_url=base_url, api_key=api_key)
+  _client = client if client is not None else _OpenAIClient(base_url=base_url, api_key=api_key)
 
   for attempt in range(max_retries):
     try:
-      completion = client.chat.completions.create(
+      completion = _client.chat.completions.create(
           model=model,
           messages=[{"role": "user", "content": prompt}],
           max_tokens=max_decode_steps,
           temperature=temperature,
+          n=n,
       )
-      return completion.choices[0].message.content
+      if n == 1:
+        return completion.choices[0].message.content
+      return [choice.message.content for choice in completion.choices]
     except Exception as e:  # pylint: disable=broad-except
       print(
           f"[vLLM] Attempt {attempt + 1}/{max_retries} failed: {e}. "
@@ -205,14 +216,14 @@ def call_vllm_server_single_prompt(
       time.sleep(retry_wait)
 
   print("[vLLM] All retries exhausted. Returning empty string.")
-  return ""
+  return "" if n == 1 else [""] * n
 
 
 def call_vllm_server_func(
     inputs,
     base_url="http://localhost:8000/v1",
     model="Qwen/Qwen2.5-7B-Instruct",
-    max_decode_steps=512,
+    max_decode_steps=1024,
     temperature=1.0,
     api_key="EMPTY",
 ):
