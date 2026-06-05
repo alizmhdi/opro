@@ -286,8 +286,13 @@ def main(_):
     meta_prompt += "\n\n"
     meta_prompt += old_value_pairs_substr.strip()
     meta_prompt += "\n\n"
-    meta_prompt += """Give me a new trace that is different from all traces above, and has a length lower than any of the above. The trace should traverse all points exactly once. The trace should start with '<trace>' and end with </trace>.
-    """.strip()
+    meta_prompt += (
+        "Give me a new trace that is different from all traces above, and has a "
+        "length lower than any of the above. The trace should traverse all points "
+        "exactly once, starting at city 0. "
+        "Output only the final solution: start with '<trace>' and end with '</trace>'. "
+        "Do not include any explanation, reasoning, or other text outside those tags."
+    )
     return meta_prompt
 
   def extract_string(input_string):
