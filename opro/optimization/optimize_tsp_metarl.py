@@ -127,7 +127,7 @@ def _coords_to_xy(coords, num_decimals=0):
 
 def run_opro_tsp(
     coords,
-    num_steps: int = 500,
+    num_steps: int = 50,
     num_decode_per_step: int = 8,
     max_num_pairs: int = 10,
     num_starting_points: int = 5,
